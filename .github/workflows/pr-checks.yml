@@ -1,0 +1,145 @@
+# PR quality gate: fmt / validate / tflint / tfsec always run.
+# plan runs only when AWS OIDC is configured (repo variable AWS_ROLE_ARN),
+# and posts the result as a sticky PR comment per environment.
+name: PR checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - run: terraform fmt -check -recursive -diff
+
+  validate:
+    name: validate (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dir: [envs/dev, envs/prod, bootstrap]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - run: terraform -chdir=${{ matrix.dir }} init -backend=false -input=false
+      - run: terraform -chdir=${{ matrix.dir }} validate -no-color
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: terraform-linters/setup-tflint@v6
+      - name: Init tflint plugins
+        run: tflint --init --config "$(pwd)/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Run tflint
+        run: tflint --recursive --config "$(pwd)/.tflint.hcl" --format compact
+
+  tfsec:
+    name: tfsec (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Scan each root module so module code is evaluated with real inputs.
+        dir: [envs/dev, envs/prod, bootstrap]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ matrix.dir }}
+          additional_args: --minimum-severity MEDIUM
+
+  plan:
+    name: plan (${{ matrix.env }})
+    # Skipped (not failed) until bootstrap outputs are registered as repo variables.
+    if: vars.AWS_ROLE_ARN != ''
+    needs: [fmt, validate, tflint, tfsec]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for keyless AWS auth
+      pull-requests: write
+    strategy:
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-2
+
+      - uses: hashicorp/setup-terraform@v4
+
+      - name: terraform init
+        run: >
+          terraform -chdir=envs/${{ matrix.env }} init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform plan
+        id: plan
+        run: terraform -chdir=envs/${{ matrix.env }} plan -input=false -no-color
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v9
+        env:
+          PLAN_STDOUT: ${{ steps.plan.outputs.stdout }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          TF_ENV: ${{ matrix.env }}
+        with:
+          script: |
+            const marker = `<!-- tf-plan-${process.env.TF_ENV} -->`;
+            const status = process.env.PLAN_OUTCOME === 'success' ? '✅' : '❌';
+            const plan = (process.env.PLAN_STDOUT || '').slice(0, 60000);
+            const body = `${marker}
+            ### ${status} terraform plan — \`${process.env.TF_ENV}\`
+
+            <details><summary>Show plan</summary>
+
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+
+            </details>`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail job if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1

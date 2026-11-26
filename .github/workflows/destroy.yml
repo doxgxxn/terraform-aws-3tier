@@ -1,0 +1,44 @@
+# Manual teardown for ephemeral environments (cost control).
+# prod RDS has deletion_protection=true — flip it off in a PR first.
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment to destroy
+        required: true
+        type: choice
+        options: [dev, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    name: destroy (${{ inputs.env }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-2
+
+      - uses: hashicorp/setup-terraform@v4
+
+      - name: terraform init
+        run: >
+          terraform -chdir=envs/${{ inputs.env }} init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform destroy
+        run: terraform -chdir=envs/${{ inputs.env }} destroy -input=false -auto-approve
